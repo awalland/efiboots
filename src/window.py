@@ -209,6 +209,7 @@ class EfibootsListStore(Gio.ListStore):
         self.edit_parameters = set()
         self.edit_loader = set()
         self.edit_name = set()
+        self.edit_entries = {}  # Maps num -> (old_row, new_label, new_path, new_parameters)
 
     def __str__(self):
         return f"next: {self.boot_next} order: {self.boot_order} add: {self.boot_add} rem: {self.boot_remove} " \
@@ -244,6 +245,7 @@ class EfibootsListStore(Gio.ListStore):
         self.edit_parameters = set()
         self.edit_loader = set()
         self.edit_name = set()
+        self.edit_entries = {}
 
     def refresh(self):
         self.clear()
@@ -320,6 +322,28 @@ class EfibootsListStore(Gio.ListStore):
         self.append(row)
         self.boot_add[new_num] = (label, path, parameters)
 
+    def edit(self, row: EfibootRowModel, new_label: str, new_path: str, new_parameters: str):
+        """Edit an existing boot entry by updating it in place and tracking the change"""
+        num = row.num
+
+        # If this is a newly added entry (not yet committed), just update boot_add
+        if num.startswith('NEW'):
+            self.boot_add[num] = (new_label, new_path, new_parameters)
+        else:
+            # For existing entries, track the edit (will delete and recreate)
+            # Store original values if this is the first edit
+            if num not in self.edit_entries:
+                self.edit_entries[num] = (row.name, row.path, row.parameters, new_label, new_path, new_parameters)
+            else:
+                # Update with new values, but keep original values
+                orig_name, orig_path, orig_params, _, _, _ = self.edit_entries[num]
+                self.edit_entries[num] = (orig_name, orig_path, orig_params, new_label, new_path, new_parameters)
+
+        # Update the row in place so UI reflects changes immediately
+        row.name = new_label
+        row.path = new_path
+        row.parameters = new_parameters
+
     def remove(self, position: int):
         item: EfibootRowModel | None = self.get_item(position)
         if item is not None:
@@ -335,17 +359,30 @@ class EfibootsListStore(Gio.ListStore):
         logging.debug("%s", self)
         return (self.boot_next_initial != self.boot_next or
                 self.boot_order_initial != self.boot_order or self.boot_add or
-                self.boot_remove or self.boot_active or self.boot_inactive
-                or self.timeout != self.timeout_initial
+                self.boot_remove or self.boot_active or self.boot_inactive or
+                self.edit_entries or self.timeout != self.timeout_initial
                 )
 
     def to_script(self, disk, part, reboot):
         esp = f"--disk {disk} --part {part}"
         script = ''
+
+        # Delete removed entries
         for entry in self.boot_remove:
             script += f'efibootmgr {esp} --delete-bootnum --bootnum {entry}\n'
+
+        # Delete old versions of edited entries (they will be recreated with new values)
+        for entry_num in self.edit_entries:
+            script += f'efibootmgr {esp} --delete-bootnum --bootnum {entry_num}\n'
+
+        # Create new entries
         for label, loader, params in self.boot_add.values():
             script += f'efibootmgr {esp} --create --label \'{label}\' --loader \'{loader}\' --unicode \'{params}\'\n'
+
+        # Recreate edited entries with new values
+        for orig_name, orig_path, orig_params, new_label, new_path, new_params in self.edit_entries.values():
+            script += f'efibootmgr {esp} --create --label \'{new_label}\' --loader \'{new_path}\' --unicode \'{new_params}\'\n'
+
         if self.boot_order != self.boot_order_initial:
             script += f'efibootmgr {esp} --bootorder {",".join(self.boot_order)}\n'
         if self.boot_next_initial != self.boot_next:
@@ -375,6 +412,7 @@ class EfibootsMainWindow(Gtk.ApplicationWindow):
     up: Gtk.Button = Gtk.Template.Child()
     down: Gtk.Button = Gtk.Template.Child()
     add: Gtk.Button = Gtk.Template.Child()
+    edit: Gtk.Button = Gtk.Template.Child()
     remove: Gtk.Button = Gtk.Template.Child()
 
     timeout_spin: Gtk.SpinButton = Gtk.Template.Child()
@@ -534,6 +572,53 @@ class EfibootsMainWindow(Gtk.ApplicationWindow):
         row: EfibootRowModel | None = self.selection_model.get_selected_item()
         if row:
             self.model.add(_("Copy of ") + row.name, row.path, row.parameters)
+
+    @Gtk.Template.Callback()
+    def on_clicked_edit(self, __: Gtk.Button):
+        row: EfibootRowModel | None = self.selection_model.get_selected_item()
+        if not row:
+            return
+
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True,
+                                   destroy_with_parent=True, message_type=Gtk.MessageType.QUESTION,
+                                   buttons=Gtk.ButtonsType.OK_CANCEL,
+                                   text=_("Edit the label (name), path, or parameters of this boot entry.\n\n"
+                                        "Label is the name that will show up in your EFI boot menu.\n\n"
+                                        "Path is the path to the loader relative to the ESP, like \\EFI\\Boot\\bootx64.efi\n\n"
+                                        "Parameters is an optional list of aguments to pass to the loader (your kernel parameters if you use EFISTUB)"))
+
+        dialog.set_title(_("Edit EFI loader"))
+        yes_button = dialog.get_widget_for_response(Gtk.ResponseType.OK)
+        dialog_box = dialog.get_content_area()
+
+        fields = ["label", "path", "parameters"]
+        entries = {}
+        grid = Gtk.Grid(row_spacing=2, column_spacing=8, halign=Gtk.Align.CENTER)
+        for i, field in enumerate(fields):
+            entries[field] = Gtk.Entry()
+            entries[field].set_size_request(400, 0)
+            label = Gtk.Label(label=field.capitalize() + ":")
+            grid.attach(label, 0, i, 1, 1)
+            grid.attach(entries[field], 1, i, 1, 1)
+
+        # Pre-fill with existing values
+        entries["label"].set_text(row.name)
+        entries["path"].set_text(row.path)
+        entries["parameters"].set_text(row.parameters)
+
+        dialog_box.append(grid)
+        entries["label"].connect('changed', lambda l: yes_button.set_sensitive(l.get_text() != ''))
+
+        def on_response(edit_dialog, response):
+            new_label, path, parameters = map(lambda e_field: entries[e_field].get_text(), fields)
+            if response == Gtk.ResponseType.OK:
+                # Check if anything changed
+                if new_label != row.name or path != row.path or parameters != row.parameters:
+                    self.model.edit(row, new_label, path, parameters)
+            edit_dialog.close()
+
+        dialog.connect('response', on_response)
+        dialog.show()
 
     @Gtk.Template.Callback()
     def on_clicked_remove(self, button: Gtk.Button):
